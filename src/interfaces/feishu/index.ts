@@ -1,5 +1,6 @@
 import { getMode } from "@/modes";
 import { routeInput } from "@/modes/router";
+import type { AgentRunEvent } from "@/core/agent";
 import type { AgentModeName } from "@/core/mode";
 import type { Runtime } from "@/app";
 import { FeishuAutomationScheduler, handleScheduleCommand } from "./scheduler";
@@ -23,6 +24,8 @@ interface FeishuEventBody {
 }
 
 const chatModes = new Map<string, AgentModeName>();
+const processedFeishuEvents = new Map<string, number>();
+const EVENT_DEDUPE_TTL_MS = 10 * 60_000;
 
 interface FeishuCardOptions {
   title: string;
@@ -81,6 +84,10 @@ async function handleFeishuEvent(
   if (!message?.message_id || !message.chat_id || message.message_type !== "text") {
     return Response.json({ ok: true });
   }
+  if (shouldSkipDuplicateEvent(body, message.message_id)) {
+    console.info(`Skipped duplicate Feishu event: ${body.header?.event_id ?? message.message_id}`);
+    return Response.json({ ok: true });
+  }
 
   const text = parseFeishuText(message.content);
   if (!text) return Response.json({ ok: true });
@@ -127,20 +134,31 @@ async function handleFeishuEvent(
     return Response.json({ ok: true });
   }
 
-  const result = await runtime.agent.run({
-    input: routed.text,
-    mode: getMode(mode),
-    visibleProcess: true,
-  });
-  const visible = parseVisibleProcess(result.answer);
+  const progress = await FeishuProgressReporter.start(message.chat_id, mode);
+  try {
+    const result = await runtime.agent.run({
+      input: routed.text,
+      mode: getMode(mode),
+      onEvent: (event) => progress.handle(event),
+    });
+    await progress.complete();
 
-  await sendCardToChat(message.chat_id, {
-    title: "Boxgent",
-    mode: result.mode,
-    text: visible.answer,
-    trace: visible.process,
-    template: modeTemplate(result.mode),
-  });
+    await sendCardToChat(message.chat_id, {
+      title: "Boxgent",
+      mode: result.mode,
+      text: result.answer,
+      template: modeTemplate(result.mode),
+    });
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    await progress.fail(reason);
+    await sendCardToChat(message.chat_id, {
+      title: "Boxgent 处理失败",
+      mode,
+      text: reason,
+      template: "red",
+    });
+  }
   return Response.json({ ok: true });
 }
 
@@ -154,6 +172,28 @@ function parseFeishuText(content: string | undefined): string {
   }
 }
 
+function shouldSkipDuplicateEvent(body: FeishuEventBody, messageId: string): boolean {
+  const key = body.header?.event_id ? `event:${body.header.event_id}` : `message:${messageId}`;
+  const now = Date.now();
+  pruneProcessedFeishuEvents(now);
+
+  const expiresAt = processedFeishuEvents.get(key);
+  if (expiresAt && expiresAt > now) {
+    return true;
+  }
+
+  processedFeishuEvents.set(key, now + EVENT_DEDUPE_TTL_MS);
+  return false;
+}
+
+function pruneProcessedFeishuEvents(now: number): void {
+  for (const [key, expiresAt] of processedFeishuEvents) {
+    if (expiresAt <= now) {
+      processedFeishuEvents.delete(key);
+    }
+  }
+}
+
 async function sendMessageToChat(chatId: string, text: string): Promise<void> {
   await sendCardToChat(chatId, {
     title: "Boxgent 自动任务",
@@ -162,11 +202,11 @@ async function sendMessageToChat(chatId: string, text: string): Promise<void> {
   });
 }
 
-async function sendCardToChat(chatId: string, options: FeishuCardOptions): Promise<void> {
-  await sendPayloadToChat(chatId, buildCardPayload(options));
+async function sendCardToChat(chatId: string, options: FeishuCardOptions): Promise<string | undefined> {
+  return sendPayloadToChat(chatId, buildCardPayload(options));
 }
 
-async function sendPayloadToChat(chatId: string, payload: FeishuMessagePayload): Promise<void> {
+async function sendPayloadToChat(chatId: string, payload: FeishuMessagePayload): Promise<string | undefined> {
   const token = await getTenantAccessToken();
   const response = await fetch("https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id", {
     method: "POST",
@@ -183,6 +223,102 @@ async function sendPayloadToChat(chatId: string, payload: FeishuMessagePayload):
 
   if (!response.ok) {
     throw new Error(`Failed to send Feishu message: ${response.status} ${await response.text()}`);
+  }
+
+  const body = await response.json() as { data?: { message_id?: string } };
+  return body.data?.message_id;
+}
+
+async function updateCardMessage(messageId: string, options: FeishuCardOptions): Promise<void> {
+  const token = await getTenantAccessToken();
+  const response = await fetch(`https://open.feishu.cn/open-apis/im/v1/messages/${messageId}`, {
+    method: "PATCH",
+    headers: {
+      authorization: `Bearer ${token}`,
+      "content-type": "application/json; charset=utf-8",
+    },
+    body: JSON.stringify({
+      content: buildCardPayload(options).content,
+    }),
+  });
+
+  if (!response.ok) {
+    console.error("Failed to update Feishu message:", response.status, await response.text());
+  }
+}
+
+class FeishuProgressReporter {
+  private readonly mode: AgentModeName;
+  private messageId?: string;
+  private readonly steps: string[] = [];
+  private updateQueue = Promise.resolve();
+
+  private constructor({ mode, messageId }: { mode: AgentModeName; messageId?: string }) {
+    this.mode = mode;
+    this.messageId = messageId;
+  }
+
+  static async start(chatId: string, mode: AgentModeName): Promise<FeishuProgressReporter> {
+    const reporter = new FeishuProgressReporter({ mode });
+    reporter.addStep("已接收请求，正在启动 Boxgent");
+    reporter.messageId = await sendCardToChat(chatId, reporter.card("Boxgent 正在处理", "处理中，状态会在这里实时刷新。"));
+    return reporter;
+  }
+
+  handle(event: AgentRunEvent): void {
+    const step = formatLiveProcessEvent(event);
+    if (!step) return;
+    this.addStep(step);
+    this.queueUpdate("Boxgent 正在处理", "处理中，状态会在这里实时刷新。");
+  }
+
+  async complete(): Promise<void> {
+    this.addStep("处理完成，正在发送正式回答");
+    await this.queueUpdate("Boxgent 已完成", "正式回答已生成。");
+  }
+
+  async fail(reason: string): Promise<void> {
+    this.addStep(`处理失败：${reason}`);
+    await this.queueUpdate("Boxgent 处理失败", "请查看下方错误信息。", "red");
+  }
+
+  private addStep(step: string): void {
+    if (this.steps[this.steps.length - 1] === step) return;
+    this.steps.push(step);
+  }
+
+  private async queueUpdate(
+    title: string,
+    text: string,
+    template: FeishuCardOptions["template"] = modeTemplate(this.mode),
+  ): Promise<void> {
+    if (!this.messageId) return;
+
+    this.updateQueue = this.updateQueue
+      .catch(() => undefined)
+      .then(async () => {
+        try {
+          await updateCardMessage(this.messageId!, this.card(title, text, template));
+        } catch (error) {
+          console.error("Failed to queue Feishu progress update:", error);
+        }
+      });
+
+    await this.updateQueue;
+  }
+
+  private card(
+    title: string,
+    text: string,
+    template: FeishuCardOptions["template"] = modeTemplate(this.mode),
+  ): FeishuCardOptions {
+    return {
+      title,
+      mode: this.mode,
+      text,
+      trace: this.steps,
+      template,
+    };
   }
 }
 
@@ -241,37 +377,30 @@ function modeTemplate(mode: string): FeishuCardOptions["template"] {
   return "blue";
 }
 
+function formatLiveProcessEvent(event: AgentRunEvent): string | undefined {
+  if (event.type === "model_start") {
+    return `第 ${event.step} 步：分析请求与上下文`;
+  }
+  if (event.type === "model_done" && event.toolCount > 0) {
+    return `规划 ${event.toolCount} 个工具调用`;
+  }
+  if (event.type === "tool_start") {
+    return `调用工具：${event.toolName}`;
+  }
+  if (event.type === "tool_done") {
+    return `${event.ok ? "完成" : "失败"}：${event.toolName}`;
+  }
+  if (event.type === "model_done") {
+    return "整理正式回答";
+  }
+  return undefined;
+}
+
 function escapeLarkMd(value: string): string {
   return value
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;");
-}
-
-function parseVisibleProcess(text: string): { process: string[]; answer: string } {
-  const process = extractTag(text, "process");
-  const answer = extractTag(text, "answer");
-  if (!process && !answer) {
-    return { process: [], answer: text };
-  }
-
-  return {
-    process: process ? normalizeProcess(process) : [],
-    answer: answer?.trim() || text.replace(/<\/?(?:process|answer)>/g, "").trim(),
-  };
-}
-
-function extractTag(text: string, tag: "process" | "answer"): string | undefined {
-  const matched = text.match(new RegExp(`<${tag}>\\s*([\\s\\S]*?)\\s*<\\/${tag}>`, "i"));
-  return matched?.[1]?.trim();
-}
-
-function normalizeProcess(process: string): string[] {
-  return process
-    .split(/\n+/)
-    .map((line) => line.replace(/^\s*(?:[-*•]|\d+[.)])\s*/, "").trim())
-    .filter(Boolean)
-    .slice(0, 3);
 }
 
 async function getTenantAccessToken(): Promise<string> {
