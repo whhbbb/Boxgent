@@ -1,0 +1,18 @@
+{
+  "name": "boxgent",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "dev": "bun run src/index.ts cli",
+    "cli": "bun run src/index.ts cli",
+    "feishu": "bun run src/index.ts feishu",
+    "check": "tsc --noEmit",
+    "build": "bun build src/index.ts --outdir dist --target bun"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5"
+  }
+}

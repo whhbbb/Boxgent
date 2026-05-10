@@ -1,0 +1,33 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+*.tsbuildinfo
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+
+# Personal memory and runtime data
+/memory/
+/logs/
+/data/
+*.log
+
+# Local caches
+.cache/
+.tmp/
+tmp/
+
+# OS / editor noise
+.DS_Store
+.idea/
+.vscode/
+
+# Feishu or model credential dumps, if created during debugging
+*token*
+*secret*
+*credential*
+*credentials*
