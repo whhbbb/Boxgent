@@ -24,6 +24,19 @@ interface FeishuEventBody {
 
 const chatModes = new Map<string, AgentModeName>();
 
+interface FeishuCardOptions {
+  title: string;
+  subtitle?: string;
+  mode?: AgentModeName | string;
+  text: string;
+  trace?: string[];
+  template?: "blue" | "green" | "turquoise" | "yellow" | "orange" | "red" | "purple" | "grey";
+}
+
+type FeishuMessagePayload =
+  | { msg_type: "text"; content: string }
+  | { msg_type: "interactive"; content: string };
+
 export async function startFeishuServer(runtime: Runtime): Promise<void> {
   const port = Number(Bun.env.FEISHU_PORT ?? 3000);
   const scheduler = new FeishuAutomationScheduler({
@@ -81,12 +94,22 @@ async function handleFeishuEvent(
       text,
     });
     if (scheduleResponse) {
-      await replyToMessage(message.message_id, scheduleResponse);
+      await sendCardToChat(message.chat_id, {
+        title: "Boxgent 自动任务",
+        mode: currentMode,
+        text: scheduleResponse,
+        template: "turquoise",
+      });
       return Response.json({ ok: true });
     }
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
-    await replyToMessage(message.message_id, `自动任务设置失败：${reason}`);
+    await sendCardToChat(message.chat_id, {
+      title: "自动任务设置失败",
+      mode: currentMode,
+      text: reason,
+      template: "red",
+    });
     return Response.json({ ok: true });
   }
 
@@ -95,16 +118,29 @@ async function handleFeishuEvent(
   chatModes.set(message.chat_id, mode);
 
   if (routed.switched && !routed.text) {
-    await replyToMessage(message.message_id, `已切换到 ${mode} 模式。`);
+    await sendCardToChat(message.chat_id, {
+      title: "Boxgent 已切换模式",
+      mode,
+      text: `当前模式：${mode}`,
+      template: modeTemplate(mode),
+    });
     return Response.json({ ok: true });
   }
 
   const result = await runtime.agent.run({
     input: routed.text,
     mode: getMode(mode),
+    visibleProcess: true,
   });
+  const visible = parseVisibleProcess(result.answer);
 
-  await replyToMessage(message.message_id, `[${result.mode}]\n${result.answer}`);
+  await sendCardToChat(message.chat_id, {
+    title: "Boxgent",
+    mode: result.mode,
+    text: visible.answer,
+    trace: visible.process,
+    template: modeTemplate(result.mode),
+  });
   return Response.json({ ok: true });
 }
 
@@ -118,26 +154,19 @@ function parseFeishuText(content: string | undefined): string {
   }
 }
 
-async function replyToMessage(messageId: string, text: string): Promise<void> {
-  const token = await getTenantAccessToken();
-  const response = await fetch(`https://open.feishu.cn/open-apis/im/v1/messages/${messageId}/reply`, {
-    method: "POST",
-    headers: {
-      authorization: `Bearer ${token}`,
-      "content-type": "application/json; charset=utf-8",
-    },
-    body: JSON.stringify({
-      msg_type: "text",
-      content: JSON.stringify({ text }),
-    }),
+async function sendMessageToChat(chatId: string, text: string): Promise<void> {
+  await sendCardToChat(chatId, {
+    title: "Boxgent 自动任务",
+    text,
+    template: "turquoise",
   });
-
-  if (!response.ok) {
-    console.error("Failed to reply Feishu message:", response.status, await response.text());
-  }
 }
 
-async function sendMessageToChat(chatId: string, text: string): Promise<void> {
+async function sendCardToChat(chatId: string, options: FeishuCardOptions): Promise<void> {
+  await sendPayloadToChat(chatId, buildCardPayload(options));
+}
+
+async function sendPayloadToChat(chatId: string, payload: FeishuMessagePayload): Promise<void> {
   const token = await getTenantAccessToken();
   const response = await fetch("https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id", {
     method: "POST",
@@ -147,14 +176,102 @@ async function sendMessageToChat(chatId: string, text: string): Promise<void> {
     },
     body: JSON.stringify({
       receive_id: chatId,
-      msg_type: "text",
-      content: JSON.stringify({ text }),
+      msg_type: payload.msg_type,
+      content: payload.content,
     }),
   });
 
   if (!response.ok) {
     throw new Error(`Failed to send Feishu message: ${response.status} ${await response.text()}`);
   }
+}
+
+function buildCardPayload(options: FeishuCardOptions): FeishuMessagePayload {
+  const mode = options.mode ? ` · ${options.mode}` : "";
+  const subtitle = options.subtitle ? `\n<font color="grey">${escapeLarkMd(options.subtitle)}</font>` : "";
+  const trace = options.trace?.length
+    ? [
+        {
+          tag: "div",
+          text: {
+            tag: "lark_md",
+            content: [
+              "**处理过程**",
+              ...options.trace.map((item) => `- ${escapeLarkMd(item)}`),
+            ].join("\n"),
+          },
+        },
+        {
+          tag: "hr",
+        },
+      ]
+    : [];
+  const content = {
+    config: {
+      wide_screen_mode: true,
+    },
+    header: {
+      template: options.template ?? "blue",
+      title: {
+        tag: "plain_text",
+        content: `${options.title}${mode}`,
+      },
+    },
+    elements: [
+      ...trace,
+      {
+        tag: "div",
+        text: {
+          tag: "lark_md",
+          content: `${subtitle}\n${escapeLarkMd(options.text)}`.trim(),
+        },
+      },
+    ],
+  };
+
+  return {
+    msg_type: "interactive",
+    content: JSON.stringify(content),
+  };
+}
+
+function modeTemplate(mode: string): FeishuCardOptions["template"] {
+  if (mode === "life") return "green";
+  if (mode === "explore") return "yellow";
+  return "blue";
+}
+
+function escapeLarkMd(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+function parseVisibleProcess(text: string): { process: string[]; answer: string } {
+  const process = extractTag(text, "process");
+  const answer = extractTag(text, "answer");
+  if (!process && !answer) {
+    return { process: [], answer: text };
+  }
+
+  return {
+    process: process ? normalizeProcess(process) : [],
+    answer: answer?.trim() || text.replace(/<\/?(?:process|answer)>/g, "").trim(),
+  };
+}
+
+function extractTag(text: string, tag: "process" | "answer"): string | undefined {
+  const matched = text.match(new RegExp(`<${tag}>\\s*([\\s\\S]*?)\\s*<\\/${tag}>`, "i"));
+  return matched?.[1]?.trim();
+}
+
+function normalizeProcess(process: string): string[] {
+  return process
+    .split(/\n+/)
+    .map((line) => line.replace(/^\s*(?:[-*•]|\d+[.)])\s*/, "").trim())
+    .filter(Boolean)
+    .slice(0, 3);
 }
 
 async function getTenantAccessToken(): Promise<string> {

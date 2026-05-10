@@ -194,7 +194,8 @@ function heroLines(currentMode: AgentModeName, meta: CliHeroMeta): string[] {
     `${color("mode", colors.dim)} ${modeBadge(currentMode)}  ${modeLegend()}  ${color("/mode /exit", colors.gray)}`,
   ];
 
-  return icon.map((line, index) => `${line}  ${text[index] ?? ""}`);
+  const textRows = alignHeroText(text, icon.length);
+  return icon.map((line, index) => `${line}  ${textRows[index] ?? ""}`);
 }
 
 function modeLegend(): string {
@@ -216,15 +217,28 @@ function logoLines(): string[] {
     "    ████  ████    ",
   ];
 
-  return mark.map((line, index) => {
-    if (index === 3) {
-      return color(line.slice(0, 7), colors.cyan) + color("BX", colors.bold) + color(line.slice(9), colors.cyan);
-    }
-    return color(line, colors.blue);
-  });
+  return mark.map((line) => color(line, colors.blue));
 }
 
 function ruleLine(): string {
   const width = Math.max(72, process.stdout.columns ?? 96);
   return color("─".repeat(width), colors.gray);
+}
+
+function alignHeroText(text: string[], height: number): string[] {
+  if (height <= text.length) return text.slice(0, height);
+
+  const rows = Array.from({ length: height }, () => "");
+  if (text.length === 0) return rows;
+
+  const lastTextIndex = text.length - 1;
+  const lastRowIndex = height - 1;
+  text.forEach((line, index) => {
+    const row = lastTextIndex === 0
+      ? 0
+      : Math.round((index / lastTextIndex) * lastRowIndex);
+    rows[row] = line;
+  });
+
+  return rows;
 }

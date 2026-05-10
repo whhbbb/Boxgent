@@ -32,14 +32,16 @@ export class BoxgentAgent {
     mode,
     signal,
     onEvent,
+    visibleProcess = false,
   }: {
     input: string;
     mode: ModeConfig;
     signal?: AbortSignal;
     onEvent?: (event: AgentRunEvent) => void;
+    visibleProcess?: boolean;
   }): Promise<AgentRunResult> {
     const messages: Message[] = [
-      textMessage("system", buildSystemPrompt(mode)),
+      textMessage("system", buildSystemPrompt(mode, { visibleProcess })),
       textMessage("user", input),
     ];
 
@@ -84,7 +86,9 @@ export class BoxgentAgent {
 
     return {
       mode: mode.name,
-      answer: "我已经达到当前运行步数上限，请缩小任务范围后继续。",
+      answer: visibleProcess
+        ? "<process>Reached the current step limit before producing a final response.</process>\n<answer>我已经达到当前运行步数上限，请缩小任务范围后继续。</answer>"
+        : "我已经达到当前运行步数上限，请缩小任务范围后继续。",
       messages,
     };
   }
@@ -99,11 +103,23 @@ function isSuccessfulToolResult(result: unknown): boolean {
   );
 }
 
-function buildSystemPrompt(mode: ModeConfig): string {
+function buildSystemPrompt(mode: ModeConfig, options: { visibleProcess: boolean }): string {
+  const visibleProcessPrompt = options.visibleProcess
+    ? `
+Visible process output is requested for this interface.
+- Respond in the user's language unless they explicitly ask for another language.
+- Include a brief user-visible process summary, not hidden chain-of-thought.
+- Keep the process summary to 1-3 concise bullets or short sentences.
+- Do not invent tool usage; mention tools only if they were actually used.
+- Wrap the process summary in <process>...</process>.
+- Wrap the final answer in <answer>...</answer>.
+- Do not put any other text outside those tags.`
+    : "";
+
   return `${mode.systemPrompt}
 
 You are running in ${mode.label}.
 Use tools when they materially improve the answer.
 When using memory, prefer reading before writing.
-Keep responses concise, useful, and grounded in the user's actual context.`;
+Keep responses concise, useful, and grounded in the user's actual context.${visibleProcessPrompt}`;
 }

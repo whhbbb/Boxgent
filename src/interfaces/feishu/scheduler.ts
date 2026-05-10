@@ -156,7 +156,7 @@ export class FeishuAutomationScheduler {
       });
       await this.sendMessage(
         task.chatId,
-        `[自动任务 ${shortId(task.id)} | ${result.mode}]\n${result.answer}`,
+        `任务 ${shortId(task.id)} · ${result.mode}\n\n${result.answer}`,
       );
       this.advance(task);
     } catch (error) {
@@ -164,7 +164,7 @@ export class FeishuAutomationScheduler {
       task.lastError = error instanceof Error ? error.message : String(error);
       task.updatedAt = Date.now();
       try {
-        await this.sendMessage(task.chatId, `[自动任务 ${shortId(task.id)} 失败]\n${task.lastError}`);
+        await this.sendMessage(task.chatId, `任务 ${shortId(task.id)} 失败\n\n${task.lastError}`);
       } catch (notifyError) {
         console.error("Failed to send Feishu automation failure message:", notifyError);
       }
